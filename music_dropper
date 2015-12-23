@@ -1,5 +1,11 @@
 #!/usr/bin/env escript
 
+%%% A command-line interface for the Music Drop Windows Phone app.
+%%% The utility allows you to send music to your Windows Phone device,
+%%% over wireless directly from the command line. The program can also
+%%% convert the music into a playable format on the Windows Phone, on
+%%% the fly.
+
 -define(TEMP_DIR, "/tmp/music_dropper/").
 -define(IP_LOC, home() ++ "/.music_dropper_ip").
 -define(CHUNK_SIZE, 1024 * 1024).
