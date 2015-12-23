@@ -1,0 +1,218 @@
+#!/usr/bin/env escript
+
+-define(TEMP_DIR, "/tmp/music_dropper/").
+-define(IP_LOC, home() ++ "/.music_dropper_ip").
+-define(CHUNK_SIZE, 1024 * 1024).
+-define(TAGS, ["artist", "album", "tracknumber", "title"]).
+
+main([]) -> usage();
+main(Args = [Arg1|Files]) ->
+	case re:run(Arg1, "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\:[0-9]+", []) of
+		{match, _} ->
+			store_ip(Arg1),
+			do_main(Arg1, Files);
+		nomatch ->
+			do_main(find_ip(), Args)
+	end.
+
+usage() ->
+	io:format(
+		"music_dropper [ip and port] files~n~n"
+		"A command line client for the Music Drop Windows Phone program. This "
+		"utility encodes (if necessary) and sends music files to a Windows Phone "
+		"running the Music Drop application. The application can be found on the "
+		"normal Windows Phone market. If no IP and port are provided, the "
+		"last known values will be reused.~n"
+		"This quick and dirty script was built to avoid the pain of trying "
+		"to use a WP device with Linux, or having to manually drag files on to "
+		"the Music Drop web application. In this way, entire music collections "
+		"can be very quickly transferred over the air, from machines traditionally "
+		"not supported at all by Windows Phone devices. ~n~n"
+		"Supported audio formats: mp3 and flac (currently)~n~n"
+		"I will add more support when I need encounter a need for it, but "
+		"contributions are always welcome! Thanks to the Music Drop team "
+		"for building the phone side program, on which this utility depends!~n~n"
+		"The creator can be contacted through Google's email service, with the "
+		"username samuel.ecwilliams.~n"
+	),
+	error.
+
+find_ip() ->
+	case file:read_file(?IP_LOC) of
+		{error, enoent} -> usage();
+		{ok, Bin} -> binary_to_list(Bin) -- "\n"
+	end.
+
+home() ->
+	{ok, [[Dir|_]]} = init:get_argument(home),
+	Dir.
+
+store_ip(IP) -> file:write_file(?IP_LOC, IP).
+
+do_main(error, _) -> ok;
+do_main(IP, Files) ->
+	inets:start(),
+	ssl:start(),
+	file:make_dir(?TEMP_DIR),
+	lists:map(
+		fun({N, File}) ->
+			case string:to_lower(filename:extension(File)) of
+				".flac" ->
+					process_file_mp3(IP,
+						process_file_flac(File, N, length(Files)), N, length(Files));
+				".mp3" ->
+					process_file_mp3(IP, File, N, length(Files));
+				_ ->
+					label_output(N, length(Files)),
+					io:format("Ignoring file '~s'.~n", [File])
+			end
+		end,
+		number(Files)
+	),
+	file:del_dir(?TEMP_DIR).
+
+process_file_flac(File, N, Len) ->
+	label_output(N, Len),
+	io:format("Re-encoding '~s' to MP3... ", [File]),
+	file:delete(NewFile = ?TEMP_DIR ++ filename:basename(File, flac) ++ "mp3"),
+	os:cmd(
+		lists:flatten(
+			io_lib:format(
+				"ffmpeg -i \"~s\" -f mp3 -ab 320k -id3v2_version 3"
+				"  -metadata title=\"~s\""
+				"  -metadata artist=\"~s\""
+				"  -metadata album=\"~s\""
+				"  -metadata track=\"~s\""
+				"  \"~s\"",
+				[
+					File,
+					extract_metadata(File, "TITLE"),
+					extract_metadata(File, "ARTIST"),
+					extract_metadata(File, "ALBUM"),
+					extract_metadata(File, "TRACKNUMBER"),
+					NewFile
+				]
+			)
+		)
+	),
+	io:format("Done.~n"),
+	NewFile.
+
+extract_metadata(File, Type) ->
+	process_tag(
+		os:cmd(
+			"metaflac --show-tag=" ++ Type ++ " \"" ++ File ++ "\""
+		)
+	).
+
+process_tag(RawStr) ->
+	Str = RawStr -- "\n",
+	case string:tokens(Str, "=") of
+		[Str] -> Str;
+		[X | Rest] ->
+			case lists:member(string:to_lower(X), ?TAGS) of
+				true -> string:join(Rest, "=");
+				false -> Str
+			end
+	end.
+
+process_file_mp3(IP, File, N, Len) ->
+	label_output(N, Len),
+	io:format("Sending file: '~s'", [filename:basename(File)]),
+	{ok, Bin} = file:read_file(File),
+	{MicroS, _} =
+		timer:tc(
+			lists,
+			foldl,
+			[
+				fun(Chunk, ChunkID) ->
+					send_chunk(
+						IP,
+						headers(File, ChunkID, Chunk),
+						Chunk
+					),
+					ChunkID + 1
+				end, 
+				0,
+				chunk(Bin)
+			]
+		),
+	io:format(" Done! (~w KB/s)~n",
+		[round((filelib:file_size(File)/1024)/(MicroS/1000000))]).
+
+headers(File, ChunkID, Chunk) ->
+	[
+		filename:basename(File),
+		filelib:file_size(File),
+		byte_size(Chunk),
+		ChunkID * ?CHUNK_SIZE
+	].
+
+chunk(Chunk) when byte_size(Chunk) < ?CHUNK_SIZE -> [Chunk];
+chunk(Bin) ->
+	[
+		binary:part(Bin, 0, ?CHUNK_SIZE)
+	|
+		chunk(binary:part(Bin, ?CHUNK_SIZE, byte_size(Bin)  - ?CHUNK_SIZE))
+	].
+
+send_chunk(IP, Hdrs, Chunk) ->
+	request(IP, Hdrs, Chunk),
+	io:format(".").
+
+request(Addr, [Name, FileSize, ChunkSize, FilePos], Chunk) ->
+	file:write_file(
+		ChunkFile =
+			?TEMP_DIR
+				++ "music_dropper_temp_"
+				++  integer_to_list(crypto:rand_uniform(1, 10000000)),
+		Chunk
+	),
+	Req = create_request(Addr, Name, FileSize, ChunkSize, FilePos, ChunkSize, ChunkFile),
+	os:cmd(Req),
+	file:delete(ChunkFile).
+
+create_request(Addr, Name, FileSize, ChunkSize, FilePos, ChunkSize, File) ->
+	lists:flatten(
+		io_lib:format(
+			"curl 'http://~s/upload'"
+			" -s"
+			" --http1.0 -i"
+			" -H 'Host: ~s'"
+			" -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:37.0) Gecko/20100101"
+				" Firefox/37.0'"
+			" -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'"
+			" -H 'Accept-Language: en-US,en;q=0.5'"
+			" --compressed -H 'DNT: 1'"
+			" -H \"X-FILENAME: ~s\""
+			" -H 'X-FILESIZE: ~w'"
+			" -H 'X-FILECHUNKSIZE: ~w'"
+			" -H 'X-FILEPOSITION: ~w'"
+			" -H 'Referer: http://~s/'"
+			" -H 'Content-Length: ~w'"
+			" -H 'Connection: keep-alive'"
+			" -H 'Pragma: no-cache'"
+			" -H 'Cache-Control: no-cache'"
+			" --data-binary @~s 2>&1 > /dev/null",
+			[
+				Addr,
+				Addr,
+				Name,
+				FileSize,
+				ChunkSize,
+				FilePos,
+				Addr,
+				ChunkSize,
+				File
+			]
+		)
+	).
+
+%% Provide a label displaying the current position in the queue
+label_output(N, Len) -> io:format("(~3.. B/~3.. B) ", [N, Len]).
+
+%% Utility functions
+
+number(L) -> number(1, L).
+number(_, []) -> [];
+number(N, [H|T]) -> [{N, H}|number(N + 1, T)].
